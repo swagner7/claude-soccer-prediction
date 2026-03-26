@@ -1,0 +1,85 @@
+version: '3'
+
+vars:
+  PYTHON: .venv/bin/python
+  DATA_DIR: data
+  MODEL_DIR: models
+  OUTPUT_DIR: outputs
+
+tasks:
+  setup:
+    desc: "Create virtual environment and install dependencies"
+    cmds:
+      - python3 -m venv .venv
+      - .venv/bin/pip install -U pip
+      - .venv/bin/pip install -e '.[dev]'
+    status:
+      - test -d .venv
+
+  download:
+    desc: "Download soccer data from football-data.co.uk and ESPN/Kaggle"
+    deps: [setup]
+    cmds:
+      - mkdir -p {{.DATA_DIR}}/raw/football-data
+      - mkdir -p {{.DATA_DIR}}/raw/espn
+      - "{{.PYTHON}} -m src.data.download"
+
+  parse:
+    desc: "Parse and clean raw CSV files into processed parquet"
+    deps: [download]
+    cmds:
+      - mkdir -p {{.DATA_DIR}}/processed
+      - "{{.PYTHON}} -m src.data.parse"
+
+  features:
+    desc: "Build feature matrix from processed match data"
+    deps: [parse]
+    cmds:
+      - mkdir -p {{.DATA_DIR}}/features
+      - "{{.PYTHON}} -m src.features.build"
+
+  train:
+    desc: "Train LightGBM model with hyperparameter tuning"
+    deps: [features]
+    cmds:
+      - mkdir -p {{.MODEL_DIR}}
+      - "{{.PYTHON}} -m src.model.train"
+
+  evaluate:
+    desc: "Evaluate model quality (log loss, calibration, etc.)"
+    deps: [train]
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}/evaluation
+      - "{{.PYTHON}} -m src.evaluate.model_eval"
+
+  bet:
+    desc: "Run betting strategy and simulate bankroll"
+    deps: [train]
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}/bets
+      - "{{.PYTHON}} -m src.betting.simulate"
+
+  evaluate-betting:
+    desc: "Evaluate betting performance (ROI, profit curves)"
+    deps: [bet]
+    cmds:
+      - "{{.PYTHON}} -m src.evaluate.betting_eval"
+
+  all:
+    desc: "Run full pipeline end-to-end"
+    cmds:
+      - task: evaluate
+      - task: evaluate-betting
+
+  clean:
+    desc: "Remove generated data, models, and outputs"
+    cmds:
+      - rm -rf {{.DATA_DIR}}/processed {{.DATA_DIR}}/features
+      - rm -rf {{.MODEL_DIR}}
+      - rm -rf {{.OUTPUT_DIR}}
+
+  test:
+    desc: "Run unit tests"
+    deps: [setup]
+    cmds:
+      - .venv/bin/pytest tests/ -v
