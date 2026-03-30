@@ -1,4 +1,4 @@
-"""Train multiple models, select best, tune it with Optuna, calibrate, and save."""
+"""Train separate model groups for Big 5 (with xG) and Others (without xG)."""
 
 import json
 import logging
@@ -20,6 +20,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 from src.config import (
+    BIG5_LEAGUES,
     CALIBRATION_FRACTION,
     FEATURES_DIR,
     MODELS_DIR,
@@ -39,15 +40,19 @@ META_COLS = [
 ]
 ODDS_PREFIX = "odds_"
 MARKET_PREFIX = "market_prob_"
+XG_PREFIX = "xg_"
 
 
-def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    return [
+def get_feature_columns(df: pd.DataFrame, include_xg: bool = True) -> list[str]:
+    cols = [
         c for c in df.columns
         if c not in META_COLS
         and not c.startswith(ODDS_PREFIX)
         and not c.startswith(MARKET_PREFIX)
     ]
+    if not include_xg:
+        cols = [c for c in cols if not c.startswith(XG_PREFIX)]
+    return cols
 
 
 def temporal_train_test_split(df, test_frac=TEST_FRACTION, cal_frac=CALIBRATION_FRACTION):
@@ -353,6 +358,17 @@ def _tune_mlp(trial, X_train, y_train, cv_splits):
     return np.mean(scores)
 
 
+@_register_tuner("logreg")
+def _tune_logreg(trial, X_train, y_train, cv_splits):
+    kw = {"C": trial.suggest_float("C", 1e-3, 100.0, log=True)}
+    scores = []
+    for tr_idx, va_idx in cv_splits:
+        pred, _ = train_logistic_regression(X_train[tr_idx], y_train[tr_idx], **kw)
+        preds = pred.predict(X_train[va_idx])
+        scores.append(log_loss(y_train[va_idx], preds, labels=[0, 1, 2]))
+    return np.mean(scores)
+
+
 # Map model names to trainers
 MODEL_TRAINERS = {
     "logreg": train_logistic_regression,
@@ -377,24 +393,29 @@ def retrain_best(best_name, best_params, X_train, y_train, X_val, y_val):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Train a single model group through all 3 phases
 # ---------------------------------------------------------------------------
 
-def main():
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+def train_group(
+    group_name: str,
+    train_df: pd.DataFrame,
+    cal_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    save_dir,
+) -> dict:
+    """Run the full 3-phase pipeline for one league group.
 
-    logger.info("Loading features...")
-    df = pd.read_parquet(FEATURES_DIR / "features.parquet")
-    df = df.dropna(subset=["result_code"])
+    Returns dict with keys: best_name, all_models, raw_results, cal_results,
+    feature_cols, col_means.
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    feature_cols = get_feature_columns(df)
-    logger.info(f"Using {len(feature_cols)} features")
-
-    train_df, cal_df, test_df = temporal_train_test_split(df)
-    logger.info(f"Split: train={len(train_df)}, cal={len(cal_df)}, test={len(test_df)}")
-    logger.info(f"Train: {train_df['date'].min()} to {train_df['date'].max()}")
-    logger.info(f"Cal:   {cal_df['date'].min()} to {cal_df['date'].max()}")
-    logger.info(f"Test:  {test_df['date'].min()} to {test_df['date'].max()}")
+    logger.info(f"  Features: {len(feature_cols)}")
+    logger.info(f"  Split: train={len(train_df)}, cal={len(cal_df)}, test={len(test_df)}")
+    logger.info(f"  Train: {train_df['date'].min()} to {train_df['date'].max()}")
+    logger.info(f"  Cal:   {cal_df['date'].min()} to {cal_df['date'].max()}")
+    logger.info(f"  Test:  {test_df['date'].min()} to {test_df['date'].max()}")
 
     X_train = train_df[feature_cols].values.astype(np.float32)
     y_train = train_df["result_code"].values.astype(int)
@@ -410,23 +431,20 @@ def main():
             mask = np.isnan(X[:, j])
             if mask.any():
                 X[mask, j] = col_means[j]
-    logger.info("Imputed NaN values with column means")
 
-    joblib.dump(col_means, MODELS_DIR / "col_means.joblib")
-    joblib.dump(feature_cols, MODELS_DIR / "feature_cols.joblib")
+    joblib.dump(col_means, save_dir / "col_means.joblib")
+    joblib.dump(feature_cols, save_dir / "feature_cols.joblib")
 
     # ===================================================================
-    # Phase 1: Screen all models with default hyperparameters
+    # Phase 1: Screen all models
     # ===================================================================
-    logger.info("\n" + "=" * 60)
-    logger.info("PHASE 1: Screening all models (default hyperparameters)")
-    logger.info("=" * 60)
+    logger.info(f"\n  --- Phase 1: Screening ({group_name}) ---")
 
-    all_models = {}   # name -> (predictor, raw_model)
-    raw_results = {}  # name -> {log_loss, accuracy, preds}
+    all_models = {}
+    raw_results = {}
 
     for name, trainer in MODEL_TRAINERS.items():
-        logger.info(f"\n  Training {name}...")
+        logger.info(f"    Training {name}...")
         try:
             if name in NEEDS_VAL:
                 pred, raw_model = trainer(X_train, y_train, X_cal, y_cal)
@@ -437,9 +455,9 @@ def main():
             acc = accuracy_score(y_test, np.argmax(preds, axis=1))
             all_models[name] = (pred, raw_model)
             raw_results[name] = {"log_loss": ll, "accuracy": acc, "preds": preds}
-            logger.info(f"    {name:25s}  log_loss={ll:.4f}  accuracy={acc:.4f}")
+            logger.info(f"      {name:25s}  log_loss={ll:.4f}  accuracy={acc:.4f}")
         except Exception as e:
-            logger.warning(f"    {name} failed: {e}")
+            logger.warning(f"      {name} failed: {e}")
 
     # Market benchmark
     market_cols = ["market_prob_home", "market_prob_draw", "market_prob_away"]
@@ -449,22 +467,20 @@ def main():
         valid = ~np.isnan(market_probs).any(axis=1)
         if valid.sum() > 0:
             market_ll = log_loss(y_test[valid], market_probs[valid], labels=[0, 1, 2])
-            logger.info(f"\n  {'market':25s}  log_loss={market_ll:.4f}")
+            logger.info(f"      {'market':25s}  log_loss={market_ll:.4f}")
 
-    # Rank by raw log loss and pick best
     ranked = sorted(raw_results.items(), key=lambda x: x[1]["log_loss"])
     screening_best = ranked[0][0]
-    logger.info(f"\n  Screening winner: {screening_best} "
+    logger.info(f"    Screening winner: {screening_best} "
                 f"(log_loss={raw_results[screening_best]['log_loss']:.4f})")
 
     # ===================================================================
-    # Phase 2: Tune the best model with Optuna
+    # Phase 2: Tune with Optuna
     # ===================================================================
-    logger.info("\n" + "=" * 60)
-    logger.info(f"PHASE 2: Tuning {screening_best} with Optuna ({OPTUNA_N_TRIALS} trials)")
-    logger.info("=" * 60)
+    logger.info(f"\n  --- Phase 2: Tuning {screening_best} ({group_name}, "
+                f"{OPTUNA_N_TRIALS} trials) ---")
 
-    cv_splits = time_series_cv_splits(len(X_train), n_splits=5)
+    cv_splits = time_series_cv_splits(len(X_train), n_splits=3)
 
     if screening_best in TUNERS:
         study = optuna.create_study(direction="minimize")
@@ -474,34 +490,29 @@ def main():
             show_progress_bar=True,
         )
         best_params = study.best_params
-        logger.info(f"  Best CV log loss: {study.best_value:.4f}")
-        logger.info(f"  Best params: {best_params}")
+        logger.info(f"    Best CV log loss: {study.best_value:.4f}")
+        logger.info(f"    Best params: {best_params}")
 
-        # Retrain with tuned params on full train set
-        logger.info(f"\n  Retraining {screening_best} with tuned params...")
         tuned_pred, tuned_model = retrain_best(
             screening_best, best_params, X_train, y_train, X_cal, y_cal
         )
         tuned_preds = tuned_pred.predict(X_test)
         tuned_ll = log_loss(y_test, tuned_preds, labels=[0, 1, 2])
         tuned_acc = accuracy_score(y_test, np.argmax(tuned_preds, axis=1))
-        logger.info(f"  Tuned {screening_best}: log_loss={tuned_ll:.4f}  accuracy={tuned_acc:.4f}")
+        logger.info(f"    Tuned {screening_best}: log_loss={tuned_ll:.4f}  "
+                    f"accuracy={tuned_acc:.4f}")
 
-        # Replace the default model with the tuned one
         all_models[screening_best] = (tuned_pred, tuned_model)
         raw_results[screening_best] = {
             "log_loss": tuned_ll, "accuracy": tuned_acc, "preds": tuned_preds,
         }
     else:
         best_params = {}
-        logger.info(f"  No tuner registered for {screening_best}, skipping Optuna.")
 
     # ===================================================================
-    # Phase 3: Calibrate all models, pick final best
+    # Phase 3: Calibrate
     # ===================================================================
-    logger.info("\n" + "=" * 60)
-    logger.info("PHASE 3: Calibrating all models (isotonic regression)")
-    logger.info("=" * 60)
+    logger.info(f"\n  --- Phase 3: Calibrating ({group_name}) ---")
 
     calibrated_models = {}
     cal_results = {}
@@ -515,43 +526,22 @@ def main():
         ll = log_loss(y_test, cal_preds, labels=[0, 1, 2])
         acc = accuracy_score(y_test, np.argmax(cal_preds, axis=1))
         cal_results[name] = {"log_loss": ll, "accuracy": acc, "preds": cal_preds}
-        logger.info(f"  {name:25s}  cal_log_loss={ll:.4f}  accuracy={acc:.4f}")
+        logger.info(f"    {name:25s}  cal_log_loss={ll:.4f}  accuracy={acc:.4f}")
 
     best_name = min(cal_results, key=lambda k: cal_results[k]["log_loss"])
-    logger.info(f"\n  FINAL BEST: {best_name} "
-                f"(calibrated log_loss={cal_results[best_name]['log_loss']:.4f})")
+    logger.info(f"    BEST for {group_name}: {best_name} "
+                f"(cal_log_loss={cal_results[best_name]['log_loss']:.4f})")
 
-    # ===================================================================
-    # Save everything
-    # ===================================================================
+    # Save models
     for name, (_, raw_model) in all_models.items():
-        joblib.dump(raw_model, MODELS_DIR / f"{name}_raw.joblib")
+        joblib.dump(raw_model, save_dir / f"{name}_raw.joblib")
     for name, calibrator in calibrated_models.items():
-        joblib.dump(calibrator, MODELS_DIR / f"{name}_calibrated.joblib")
-    joblib.dump(best_name, MODELS_DIR / "best_model_name.joblib")
-
-    # Test predictions
-    test_results = test_df[
-        ["date", "home_team", "away_team", "result", "result_code",
-         "home_goals", "away_goals", "league", "season"]
-        + [c for c in test_df.columns if c.startswith("odds_")]
-        + [c for c in test_df.columns if c.startswith("market_prob_")]
-    ].copy()
-
-    best_preds = cal_results[best_name]["preds"]
-    test_results["prob_home"] = best_preds[:, 0]
-    test_results["prob_draw"] = best_preds[:, 1]
-    test_results["prob_away"] = best_preds[:, 2]
-
-    for name in all_models:
-        for i, outcome in enumerate(["home", "draw", "away"]):
-            test_results[f"raw_{name}_prob_{outcome}"] = raw_results[name]["preds"][:, i]
-            test_results[f"cal_{name}_prob_{outcome}"] = cal_results[name]["preds"][:, i]
-
-    test_results.to_parquet(MODELS_DIR / "test_predictions.parquet", index=False)
+        joblib.dump(calibrator, save_dir / f"{name}_calibrated.joblib")
+    joblib.dump(best_name, save_dir / "best_model_name.joblib")
 
     # Model comparison JSON
     comparison = {
+        "group": group_name,
         "models": {},
         "best_model": best_name,
         "tuned_model": screening_best,
@@ -565,9 +555,160 @@ def main():
             "cal_log_loss": round(cal_results[name]["log_loss"], 4),
             "cal_accuracy": round(cal_results[name]["accuracy"], 4),
         }
+    with open(save_dir / "model_comparison.json", "w") as f:
+        json.dump(comparison, f, indent=2)
+
+    return {
+        "best_name": best_name,
+        "all_models": all_models,
+        "raw_results": raw_results,
+        "cal_results": cal_results,
+        "feature_cols": feature_cols,
+        "col_means": col_means,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading features...")
+    df = pd.read_parquet(FEATURES_DIR / "features.parquet")
+    df = df.dropna(subset=["result_code"])
+
+    # Split into Big 5 and Others
+    is_big5 = df["league"].isin(BIG5_LEAGUES)
+    big5_df = df[is_big5].copy()
+    others_df = df[~is_big5].copy()
+
+    logger.info(f"Big 5:   {len(big5_df)} matches ({sorted(big5_df['league'].unique())})")
+    logger.info(f"Others:  {len(others_df)} matches ({sorted(others_df['league'].unique())})")
+
+    # Feature columns: Big 5 gets xG features, Others does not
+    big5_features = get_feature_columns(df, include_xg=True)
+    others_features = get_feature_columns(df, include_xg=False)
+    logger.info(f"Big 5 features: {len(big5_features)}  |  Others features: {len(others_features)}")
+
+    # Temporal splits per group
+    big5_train, big5_cal, big5_test = temporal_train_test_split(big5_df)
+    others_train, others_cal, others_test = temporal_train_test_split(others_df)
+
+    # ===================================================================
+    # Train Big 5 group
+    # ===================================================================
+    logger.info("\n" + "=" * 70)
+    logger.info("GROUP: Big 5 (Premier League, La Liga, Bundesliga, Serie A, Ligue 1)")
+    logger.info("=" * 70)
+
+    big5_result = train_group(
+        "big5", big5_train, big5_cal, big5_test, big5_features,
+        MODELS_DIR / "big5",
+    )
+
+    # ===================================================================
+    # Train Others group
+    # ===================================================================
+    logger.info("\n" + "=" * 70)
+    logger.info("GROUP: Others (Championship, Eredivisie, Belgian Pro, Primeira, "
+                "Super Lig, Greece)")
+    logger.info("=" * 70)
+
+    others_result = train_group(
+        "others", others_train, others_cal, others_test, others_features,
+        MODELS_DIR / "others",
+    )
+
+    # ===================================================================
+    # Build unified test predictions
+    # ===================================================================
+    logger.info("\n" + "=" * 70)
+    logger.info("Merging test predictions from both groups")
+    logger.info("=" * 70)
+
+    info_cols = (
+        ["date", "home_team", "away_team", "result", "result_code",
+         "home_goals", "away_goals", "league", "season"]
+        + [c for c in df.columns if c.startswith("odds_")]
+        + [c for c in df.columns if c.startswith("market_prob_")]
+    )
+
+    def build_test_results(test_df, result_dict, group_name):
+        out = test_df[[c for c in info_cols if c in test_df.columns]].copy()
+        out["model_group"] = group_name
+        best = result_dict["best_name"]
+        best_preds = result_dict["cal_results"][best]["preds"]
+        out["prob_home"] = best_preds[:, 0]
+        out["prob_draw"] = best_preds[:, 1]
+        out["prob_away"] = best_preds[:, 2]
+
+        for name in result_dict["all_models"]:
+            for i, outcome in enumerate(["home", "draw", "away"]):
+                out[f"raw_{name}_prob_{outcome}"] = result_dict["raw_results"][name]["preds"][:, i]
+                out[f"cal_{name}_prob_{outcome}"] = result_dict["cal_results"][name]["preds"][:, i]
+        return out
+
+    big5_out = build_test_results(big5_test, big5_result, "big5")
+    others_out = build_test_results(others_test, others_result, "others")
+
+    # Unified test predictions
+    combined = pd.concat([big5_out, others_out], ignore_index=True)
+    combined = combined.sort_values("date").reset_index(drop=True)
+    combined.to_parquet(MODELS_DIR / "test_predictions.parquet", index=False)
+
+    logger.info(f"  Big 5 test: {len(big5_out)} matches, "
+                f"best={big5_result['best_name']} "
+                f"(cal_ll={big5_result['cal_results'][big5_result['best_name']]['log_loss']:.4f})")
+    logger.info(f"  Others test: {len(others_out)} matches, "
+                f"best={others_result['best_name']} "
+                f"(cal_ll={others_result['cal_results'][others_result['best_name']]['log_loss']:.4f})")
+    logger.info(f"  Combined: {len(combined)} test predictions saved")
+
+    # Combined model comparison for evaluation plots
+    combined_comparison = {
+        "groups": {
+            "big5": json.loads((MODELS_DIR / "big5" / "model_comparison.json").read_text()),
+            "others": json.loads((MODELS_DIR / "others" / "model_comparison.json").read_text()),
+        },
+        "models": {},
+    }
+    # Merge per-model metrics across both groups (weighted average)
+    all_model_names = set(big5_result["cal_results"].keys()) | set(others_result["cal_results"].keys())
+    n_big5 = len(big5_test)
+    n_others = len(others_test)
+    n_total = n_big5 + n_others
+    for name in all_model_names:
+        entry = {}
+        for metric_key in ["cal_log_loss", "cal_accuracy", "raw_log_loss", "raw_accuracy"]:
+            vals = []
+            if name in big5_result["cal_results"]:
+                src = big5_result["cal_results"] if "cal" in metric_key else big5_result["raw_results"]
+                k = metric_key.replace("cal_", "").replace("raw_", "")
+                vals.append((src[name][k if "cal" not in metric_key else metric_key.replace("cal_", "")], n_big5))
+            if name in others_result["cal_results"]:
+                src = others_result["cal_results"] if "cal" in metric_key else others_result["raw_results"]
+                k = metric_key.replace("cal_", "").replace("raw_", "")
+                vals.append((src[name][k if "cal" not in metric_key else metric_key.replace("cal_", "")], n_others))
+            if vals:
+                entry[metric_key] = round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 4)
+        combined_comparison["models"][name] = entry
+
+    # Market benchmark (weighted)
+    big5_mll = combined_comparison["groups"]["big5"].get("market_log_loss")
+    others_mll = combined_comparison["groups"]["others"].get("market_log_loss")
+    if big5_mll and others_mll:
+        combined_comparison["market_log_loss"] = round(
+            (big5_mll * n_big5 + others_mll * n_others) / n_total, 4
+        )
+    elif big5_mll:
+        combined_comparison["market_log_loss"] = big5_mll
+    elif others_mll:
+        combined_comparison["market_log_loss"] = others_mll
 
     with open(MODELS_DIR / "model_comparison.json", "w") as f:
-        json.dump(comparison, f, indent=2)
+        json.dump(combined_comparison, f, indent=2)
 
     logger.info(f"\nAll models saved to {MODELS_DIR}")
 

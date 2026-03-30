@@ -169,40 +169,49 @@ def model_comparison_bar_chart(comparison: dict, output_path: Path):
 
 
 def feature_importance_plot(output_path: Path, top_n: int = 25):
-    """Plot feature importances from all available models."""
+    """Plot feature importances from the best model in each group."""
     import joblib
 
-    feature_cols = joblib.load(MODELS_DIR / "feature_cols.joblib")
-    importances = {}
+    panels = []  # (title, feature_cols, importances)
 
-    for model_name in ALL_MODEL_NAMES:
-        model_path = MODELS_DIR / f"{model_name}_raw.joblib"
+    for group_name in ["big5", "others"]:
+        group_dir = MODELS_DIR / group_name
+        fc_path = group_dir / "feature_cols.joblib"
+        best_path = group_dir / "best_model_name.joblib"
+        if not fc_path.exists() or not best_path.exists():
+            continue
+
+        feature_cols = joblib.load(fc_path)
+        best_name = joblib.load(best_path)
+        model_path = group_dir / f"{best_name}_raw.joblib"
         if not model_path.exists():
             continue
+
         try:
             model = joblib.load(model_path)
-            label = MODEL_LABELS.get(model_name, model_name)
+            imp = None
             if hasattr(model, "coef_"):
-                importances[label] = np.abs(model.coef_).mean(axis=0)
+                imp = np.abs(model.coef_).mean(axis=0)
             elif hasattr(model, "feature_importances_"):
-                importances[label] = model.feature_importances_.astype(float)
+                imp = model.feature_importances_.astype(float)
             elif hasattr(model, "feature_importance"):
-                importances[label] = model.feature_importance(
-                    importance_type="gain"
-                ).astype(float)
+                imp = model.feature_importance(importance_type="gain").astype(float)
+            if imp is not None:
+                label = MODEL_LABELS.get(best_name, best_name)
+                title = f"{group_name.replace('big5', 'Big 5').replace('others', 'Others')} — {label}"
+                panels.append((title, feature_cols, imp))
         except Exception:
             pass
 
-    if not importances:
+    if not panels:
         return
 
-    n_models = len(importances)
-    fig, axes = plt.subplots(1, n_models, figsize=(8 * n_models, 10))
-    if n_models == 1:
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 10))
+    if n_panels == 1:
         axes = [axes]
 
-    for ax, (model_name, imp) in zip(axes, importances.items()):
-        # Normalize to [0, 1] for comparability
+    for ax, (title, feature_cols, imp) in zip(axes, panels):
         imp_norm = imp / imp.max() if imp.max() > 0 else imp
         n = min(top_n, len(imp_norm))
         idx = np.argsort(imp_norm)[-n:]
@@ -212,10 +221,10 @@ def feature_importance_plot(output_path: Path, top_n: int = 25):
         ax.set_yticks(range(len(idx)))
         ax.set_yticklabels([feature_cols[i] for i in idx], fontsize=9)
         ax.set_xlabel("Normalized Importance", fontsize=11)
-        ax.set_title(f"{model_name}", fontsize=13, fontweight="bold")
+        ax.set_title(title, fontsize=13, fontweight="bold")
         ax.grid(True, alpha=0.2, axis="x")
 
-    plt.suptitle(f"Top {top_n} Feature Importances by Model",
+    plt.suptitle(f"Top {top_n} Feature Importances (Best Model per Group)",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -389,7 +398,7 @@ def main():
             logger.info(f"  {k}: {v:.4f}")
 
     if "per_model" in metrics:
-        logger.info("\n=== Per-Model Comparison ===")
+        logger.info("\n=== Per-Model Comparison (combined) ===")
         for name, m in sorted(metrics["per_model"].items(),
                                key=lambda x: x[1]["cal_log_loss"]):
             label = MODEL_LABELS.get(name, name)
@@ -398,6 +407,20 @@ def main():
                 parts.append(f"raw_ll={m['raw_log_loss']:.4f}")
             parts.append(f"acc={m['cal_accuracy']:.4f}")
             logger.info(f"  {label:25s} {', '.join(parts)}")
+
+    # Per-group metrics
+    if "model_group" in predictions.columns:
+        for group in sorted(predictions["model_group"].unique()):
+            gp = predictions[predictions["model_group"] == group]
+            y_g = gp["result_code"].values.astype(int)
+            p_g = gp[["prob_home", "prob_draw", "prob_away"]].values
+            ll = log_loss(y_g, p_g, labels=[0, 1, 2])
+            acc = accuracy_score(y_g, np.argmax(p_g, axis=1))
+            logger.info(f"\n=== {group.replace('big5','Big 5').replace('others','Others')} "
+                       f"({len(gp)} matches) ===")
+            logger.info(f"  Best model log_loss={ll:.4f}  accuracy={acc:.1%}")
+            leagues = sorted(gp["league"].unique())
+            logger.info(f"  Leagues: {', '.join(leagues)}")
 
 
 if __name__ == "__main__":

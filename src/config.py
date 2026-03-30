@@ -32,6 +32,9 @@ LEAGUES = {
 # Season codes for football-data.co.uk (last 5 seasons)
 SEASONS = ["2021", "2122", "2223", "2324", "2425"]
 
+# League groups
+BIG5_LEAGUES = {"Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"}
+
 # Feature engineering
 FORM_WINDOWS = [5, 10]
 H2H_MAX_LOOKBACK = 10
