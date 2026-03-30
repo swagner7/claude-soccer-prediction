@@ -39,7 +39,7 @@ tasks:
       - "{{.PYTHON}} -m src.features.build"
 
   train:
-    desc: "Train LightGBM model with hyperparameter tuning"
+    desc: "Train models (LogReg, Random Forest, LightGBM), calibrate, and compare"
     deps: [features]
     cmds:
       - mkdir -p {{.MODEL_DIR}}

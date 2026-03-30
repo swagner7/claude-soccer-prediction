@@ -33,6 +33,9 @@ def compute_rest_days(matches: pd.DataFrame) -> pd.DataFrame:
         results.append({
             "home_rest_days": home_rest,
             "away_rest_days": away_rest,
+            "rest_diff": (home_rest - away_rest) if (
+                pd.notna(home_rest) and pd.notna(away_rest)
+            ) else np.nan,
         })
 
         last_match[home] = date
@@ -70,6 +73,192 @@ def compute_market_implied_probs(matches: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results, index=matches.index)
 
 
+def compute_scoring_patterns(matches: pd.DataFrame) -> pd.DataFrame:
+    """Compute scoring pattern features: streaks, BTTS, over/under tendencies."""
+    team_histories: dict[str, list[dict]] = {}
+
+    for _, row in matches.iterrows():
+        date = row["date"]
+        for side in ["home", "away"]:
+            team = row[f"{side}_team"]
+            opp_side = "away" if side == "home" else "home"
+            gf = row[f"{side}_goals"]
+            ga = row[f"{opp_side}_goals"]
+            if team not in team_histories:
+                team_histories[team] = []
+            team_histories[team].append({
+                "date": date,
+                "goals_for": gf,
+                "goals_against": ga,
+                "total_goals": gf + ga,
+                "btts": 1 if (gf > 0 and ga > 0) else 0,
+                "over25": 1 if (gf + ga) > 2.5 else 0,
+                "scored": 1 if gf > 0 else 0,
+                "conceded": 1 if ga > 0 else 0,
+                "won": 1 if gf > ga else 0,
+            })
+
+    results = []
+    for _, row in matches.iterrows():
+        date = row["date"]
+        feats = {}
+
+        for side in ["home", "away"]:
+            team = row[f"{side}_team"]
+            history = team_histories.get(team, [])
+            past = [h for h in history if h["date"] < date]
+            recent = past[-5:] if past else []
+            n = len(recent)
+
+            if n == 0:
+                feats[f"{side}_scored_pct_5"] = np.nan
+                feats[f"{side}_btts_pct_5"] = np.nan
+                feats[f"{side}_over25_pct_5"] = np.nan
+                feats[f"{side}_avg_total_goals_5"] = np.nan
+                feats[f"{side}_win_streak"] = 0
+                feats[f"{side}_unbeaten_streak"] = 0
+                feats[f"{side}_scoring_streak"] = 0
+            else:
+                feats[f"{side}_scored_pct_5"] = sum(r["scored"] for r in recent) / n
+                feats[f"{side}_btts_pct_5"] = sum(r["btts"] for r in recent) / n
+                feats[f"{side}_over25_pct_5"] = sum(r["over25"] for r in recent) / n
+                feats[f"{side}_avg_total_goals_5"] = sum(
+                    r["total_goals"] for r in recent
+                ) / n
+
+                # Streaks (from most recent backwards)
+                win_streak = 0
+                for r in reversed(past):
+                    if r["won"]:
+                        win_streak += 1
+                    else:
+                        break
+                feats[f"{side}_win_streak"] = win_streak
+
+                unbeaten = 0
+                for r in reversed(past):
+                    if r["goals_for"] >= r["goals_against"]:
+                        unbeaten += 1
+                    else:
+                        break
+                feats[f"{side}_unbeaten_streak"] = unbeaten
+
+                scoring = 0
+                for r in reversed(past):
+                    if r["scored"]:
+                        scoring += 1
+                    else:
+                        break
+                feats[f"{side}_scoring_streak"] = scoring
+
+        results.append(feats)
+
+    return pd.DataFrame(results, index=matches.index)
+
+
+def compute_league_position_proxy(matches: pd.DataFrame) -> pd.DataFrame:
+    """Compute a league position proxy via cumulative points within each season+division."""
+    # Build cumulative points per team per season-division
+    team_season_pts: dict[tuple[str, str, str], int] = {}  # (team, season, div) -> pts
+    team_season_gd: dict[tuple[str, str, str], int] = {}
+    team_season_played: dict[tuple[str, str, str], int] = {}
+
+    results = []
+    for _, row in matches.iterrows():
+        season = row["season"]
+        div = row["division"]
+        home = row["home_team"]
+        away = row["away_team"]
+        result = row["result"]
+
+        hk = (home, season, div)
+        ak = (away, season, div)
+
+        # Record pre-match standing
+        h_pts = team_season_pts.get(hk, 0)
+        a_pts = team_season_pts.get(ak, 0)
+        h_gd = team_season_gd.get(hk, 0)
+        a_gd = team_season_gd.get(ak, 0)
+        h_played = team_season_played.get(hk, 0)
+        a_played = team_season_played.get(ak, 0)
+
+        h_ppg = h_pts / h_played if h_played > 0 else np.nan
+        a_ppg = a_pts / a_played if a_played > 0 else np.nan
+
+        results.append({
+            "home_season_pts": h_pts,
+            "away_season_pts": a_pts,
+            "home_season_gd": h_gd,
+            "away_season_gd": a_gd,
+            "home_ppg": h_ppg,
+            "away_ppg": a_ppg,
+            "ppg_diff": (h_ppg - a_ppg) if (
+                pd.notna(h_ppg) and pd.notna(a_ppg)
+            ) else np.nan,
+        })
+
+        # Update standings
+        hg = row["home_goals"]
+        ag = row["away_goals"]
+        if result == "H":
+            team_season_pts[hk] = h_pts + 3
+            team_season_pts[ak] = a_pts
+        elif result == "A":
+            team_season_pts[hk] = h_pts
+            team_season_pts[ak] = a_pts + 3
+        else:
+            team_season_pts[hk] = h_pts + 1
+            team_season_pts[ak] = a_pts + 1
+
+        team_season_gd[hk] = h_gd + (hg - ag)
+        team_season_gd[ak] = a_gd + (ag - hg)
+        team_season_played[hk] = h_played + 1
+        team_season_played[ak] = a_played + 1
+
+    return pd.DataFrame(results, index=matches.index)
+
+
+def compute_goal_supremacy(matches: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling average goal supremacy (goal diff per match)."""
+    team_histories: dict[str, list[dict]] = {}
+
+    for _, row in matches.iterrows():
+        date = row["date"]
+        for side in ["home", "away"]:
+            team = row[f"{side}_team"]
+            opp_side = "away" if side == "home" else "home"
+            gf = row[f"{side}_goals"]
+            ga = row[f"{opp_side}_goals"]
+            if team not in team_histories:
+                team_histories[team] = []
+            team_histories[team].append({
+                "date": date,
+                "supremacy": gf - ga,
+            })
+
+    results = []
+    for _, row in matches.iterrows():
+        date = row["date"]
+        feats = {}
+        for side in ["home", "away"]:
+            team = row[f"{side}_team"]
+            history = team_histories.get(team, [])
+            past = [h for h in history if h["date"] < date]
+
+            for w in [3, 5, 10]:
+                recent = past[-w:] if past else []
+                if recent:
+                    feats[f"{side}_supremacy_avg_{w}"] = np.mean(
+                        [r["supremacy"] for r in recent]
+                    )
+                else:
+                    feats[f"{side}_supremacy_avg_{w}"] = np.nan
+
+        results.append(feats)
+
+    return pd.DataFrame(results, index=matches.index)
+
+
 def build_feature_matrix(matches: pd.DataFrame) -> pd.DataFrame:
     """Build complete feature matrix. All features use only pre-match data."""
     # Matches must be sorted by date
@@ -90,6 +279,15 @@ def build_feature_matrix(matches: pd.DataFrame) -> pd.DataFrame:
     logger.info("Computing rest days...")
     rest = compute_rest_days(matches)
 
+    logger.info("Computing scoring patterns...")
+    scoring = compute_scoring_patterns(matches)
+
+    logger.info("Computing league position proxy...")
+    league_pos = compute_league_position_proxy(matches)
+
+    logger.info("Computing goal supremacy...")
+    supremacy = compute_goal_supremacy(matches)
+
     logger.info("Computing market implied probabilities...")
     market = compute_market_implied_probs(matches)
 
@@ -98,7 +296,10 @@ def build_feature_matrix(matches: pd.DataFrame) -> pd.DataFrame:
     league_encoded = le.fit_transform(matches["division"])
 
     # Combine all features
-    features = pd.concat([elo, form, h2h, stats, rest, market], axis=1)
+    features = pd.concat(
+        [elo, form, h2h, stats, rest, scoring, league_pos, supremacy, market],
+        axis=1,
+    )
     features["league_code"] = league_encoded
 
     # Add identifiers and target
