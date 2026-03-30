@@ -17,11 +17,12 @@ tasks:
       - test -d .venv
 
   download:
-    desc: "Download soccer data from football-data.co.uk and ESPN/Kaggle"
+    desc: "Download soccer data from football-data.co.uk, Understat, and ESPN/Kaggle"
     deps: [setup]
     cmds:
       - mkdir -p {{.DATA_DIR}}/raw/football-data
       - mkdir -p {{.DATA_DIR}}/raw/espn
+      - mkdir -p {{.DATA_DIR}}/raw/understat
       - "{{.PYTHON}} -m src.data.download"
 
   parse:

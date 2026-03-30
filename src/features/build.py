@@ -259,6 +259,93 @@ def compute_goal_supremacy(matches: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results, index=matches.index)
 
 
+def compute_xg_features(matches: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling xG-based features using Understat data.
+
+    Only uses pre-match xG data (from prior matches) to avoid leakage.
+    For leagues without xG data, all features will be NaN.
+    """
+    has_xg = "home_xg" in matches.columns
+    if not has_xg:
+        logger.info("No xG columns found in matches, skipping xG features")
+        return pd.DataFrame(index=matches.index)
+
+    team_xg_history: dict[str, list[dict]] = {}
+
+    for _, row in matches.iterrows():
+        date = row["date"]
+        home_xg = row.get("home_xg")
+        away_xg = row.get("away_xg")
+
+        if pd.isna(home_xg) or pd.isna(away_xg):
+            continue
+
+        home = row["home_team"]
+        away = row["away_team"]
+        hg = row["home_goals"]
+        ag = row["away_goals"]
+
+        for team, side in [(home, "home"), (away, "away")]:
+            opp_side = "away" if side == "home" else "home"
+            xg_for = row[f"{side}_xg"]
+            xg_against = row[f"{opp_side}_xg"]
+            goals_for = row[f"{side}_goals"]
+            goals_against = row[f"{opp_side}_goals"]
+
+            if team not in team_xg_history:
+                team_xg_history[team] = []
+            team_xg_history[team].append({
+                "date": date,
+                "xg_for": xg_for,
+                "xg_against": xg_against,
+                "goals_for": goals_for,
+                "goals_against": goals_against,
+                "xg_diff": xg_for - xg_against,
+                "xg_overperformance": goals_for - xg_for,
+            })
+
+    results = []
+    for _, row in matches.iterrows():
+        date = row["date"]
+        feats = {}
+
+        for side in ["home", "away"]:
+            team = row[f"{side}_team"]
+            history = team_xg_history.get(team, [])
+            past = [h for h in history if h["date"] < date]
+
+            for window in [5, 10]:
+                recent = past[-window:] if past else []
+                n = len(recent)
+                suffix = f"{side}_{window}"
+
+                if n == 0:
+                    feats[f"xg_for_avg_{suffix}"] = np.nan
+                    feats[f"xg_against_avg_{suffix}"] = np.nan
+                    feats[f"xg_diff_avg_{suffix}"] = np.nan
+                    feats[f"xg_overperf_avg_{suffix}"] = np.nan
+                else:
+                    feats[f"xg_for_avg_{suffix}"] = np.mean([r["xg_for"] for r in recent])
+                    feats[f"xg_against_avg_{suffix}"] = np.mean([r["xg_against"] for r in recent])
+                    feats[f"xg_diff_avg_{suffix}"] = np.mean([r["xg_diff"] for r in recent])
+                    feats[f"xg_overperf_avg_{suffix}"] = np.mean(
+                        [r["xg_overperformance"] for r in recent]
+                    )
+
+        # xG differentials between teams
+        for window in [5, 10]:
+            h_diff = feats.get(f"xg_diff_avg_home_{window}")
+            a_diff = feats.get(f"xg_diff_avg_away_{window}")
+            if pd.notna(h_diff) and pd.notna(a_diff):
+                feats[f"xg_diff_spread_{window}"] = h_diff - a_diff
+            else:
+                feats[f"xg_diff_spread_{window}"] = np.nan
+
+        results.append(feats)
+
+    return pd.DataFrame(results, index=matches.index)
+
+
 def build_feature_matrix(matches: pd.DataFrame) -> pd.DataFrame:
     """Build complete feature matrix. All features use only pre-match data."""
     # Matches must be sorted by date
@@ -291,15 +378,18 @@ def build_feature_matrix(matches: pd.DataFrame) -> pd.DataFrame:
     logger.info("Computing market implied probabilities...")
     market = compute_market_implied_probs(matches)
 
+    logger.info("Computing xG features...")
+    xg = compute_xg_features(matches)
+
     # Encode league as numeric
     le = LabelEncoder()
     league_encoded = le.fit_transform(matches["division"])
 
     # Combine all features
-    features = pd.concat(
-        [elo, form, h2h, stats, rest, scoring, league_pos, supremacy, market],
-        axis=1,
-    )
+    feature_dfs = [elo, form, h2h, stats, rest, scoring, league_pos, supremacy, market]
+    if not xg.empty:
+        feature_dfs.append(xg)
+    features = pd.concat(feature_dfs, axis=1)
     features["league_code"] = league_encoded
 
     # Add identifiers and target
