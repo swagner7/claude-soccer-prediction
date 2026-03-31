@@ -50,9 +50,30 @@ OPTUNA_N_TRIALS = 50
 
 # Betting
 INITIAL_BANKROLL = 1000.0
-MIN_EDGE = 0.05
-MIN_PROB = 0.10
-MAX_ODDS = 10.0
-KELLY_FRACTION = 0.25
-MAX_SINGLE_BET_PCT = 0.05
-MAX_TOTAL_EXPOSURE_PCT = 0.20
+MIN_EDGE = 0.08
+MIN_PROB = 0.15
+MAX_ODDS = 4.0
+KELLY_FRACTION = 0.15
+MAX_SINGLE_BET_PCT = 0.03
+MAX_TOTAL_EXPOSURE_PCT = 0.15
+
+# Market shrinkage: blend model prob toward market prob to reduce overconfidence.
+# 0.0 = pure model, 1.0 = pure market. 0.3 means 70% model / 30% market.
+MARKET_SHRINKAGE = 0.30
+
+# Max divergence from market: skip bets where model prob is more than this far
+# from the market-implied prob (filters out the most overconfident predictions).
+MAX_MARKET_DIVERGENCE = 0.15
+
+# Use Pinnacle (sharp) odds as the benchmark for edge calculation when available.
+# Fall back to average odds if Pinnacle not available.
+PREFERRED_ODDS_TYPE = "pin"
+
+# Adjusted probability range: skip bets outside this range.
+# Too low = longshots where model is most overconfident.
+# Too high = heavy favorites where edge is noise.
+MIN_ADJ_PROB = 0.25
+MAX_ADJ_PROB = 0.55
+
+# Leagues to exclude from betting (low data quality, illiquid markets).
+EXCLUDED_LEAGUES = {"Super League Greece", "Super Lig"}

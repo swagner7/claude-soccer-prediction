@@ -14,6 +14,7 @@ import pandas as pd
 
 from src.betting.simulate import simulate_bankroll
 from src.config import BETS_DIR, EVAL_DIR, INITIAL_BANKROLL
+from src.evaluate.clv_analysis import run_clv_analysis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -281,6 +282,12 @@ def evaluate_betting(
     roi_by_league_plot(value_bets, output_dir / "roi_by_league.png")
     bet_outcome_distribution_plot(value_bets, output_dir / "bet_outcomes.png")
     per_league_bankroll_plot(value_bets, output_dir / "bankroll_by_league.png")
+
+    # --- CLV Analysis ---
+    if not value_bets.empty:
+        clv_summary = run_clv_analysis(value_bets, output_dir)
+        if clv_summary:
+            metrics["clv"] = clv_summary
 
     # Save metrics
     with open(output_dir / "betting_metrics.json", "w") as f:

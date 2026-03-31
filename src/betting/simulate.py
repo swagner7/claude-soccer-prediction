@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.betting.kelly import size_bets
 from src.betting.value import find_value_bets
-from src.config import BETS_DIR, INITIAL_BANKROLL, MODELS_DIR
+from src.config import BETS_DIR, INITIAL_BANKROLL, MODELS_DIR, PREFERRED_ODDS_TYPE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -73,18 +73,20 @@ def main():
     predictions = pd.read_parquet(MODELS_DIR / "test_predictions.parquet")
 
     logger.info("Finding value bets...")
-    value_bets = find_value_bets(predictions, odds_type="avg")
+    value_bets = find_value_bets(predictions, odds_type=PREFERRED_ODDS_TYPE)
     logger.info(f"Found {len(value_bets)} value bets")
 
     if not value_bets.empty:
         value_bets.to_csv(BETS_DIR / "value_bets.csv", index=False)
         logger.info(f"Win rate: {value_bets['won'].mean():.1%}")
+        logger.info(f"Avg edge: {value_bets['edge'].mean():.3f}")
+        logger.info(f"Avg odds: {value_bets['odds'].mean():.2f}")
 
-        # Also find bets using max odds
-        value_bets_max = find_value_bets(predictions, odds_type="max")
-        if not value_bets_max.empty:
-            value_bets_max.to_csv(BETS_DIR / "value_bets_max.csv", index=False)
-            logger.info(f"Max odds value bets: {len(value_bets_max)}")
+        # Also find bets using avg odds for comparison
+        value_bets_avg = find_value_bets(predictions, odds_type="avg")
+        if not value_bets_avg.empty:
+            value_bets_avg.to_csv(BETS_DIR / "value_bets_avg.csv", index=False)
+            logger.info(f"Avg odds value bets: {len(value_bets_avg)}")
 
         logger.info("Simulating bankroll...")
         simulation = simulate_bankroll(value_bets)

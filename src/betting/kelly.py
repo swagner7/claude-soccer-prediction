@@ -1,6 +1,5 @@
 """Kelly criterion bet sizing."""
 
-import numpy as np
 import pandas as pd
 
 from src.config import KELLY_FRACTION, MAX_SINGLE_BET_PCT, MAX_TOTAL_EXPOSURE_PCT
@@ -27,13 +26,20 @@ def size_bets(
     max_single_pct: float = MAX_SINGLE_BET_PCT,
     max_total_pct: float = MAX_TOTAL_EXPOSURE_PCT,
 ) -> pd.DataFrame:
-    """Apply Kelly sizing with exposure constraints."""
+    """Apply Kelly sizing with exposure constraints.
+
+    Uses adj_prob (market-shrunk probability) for sizing if available,
+    otherwise falls back to model_prob.
+    """
     if value_bets.empty:
         return value_bets
 
     bets = value_bets.copy()
+
+    # Use adjusted prob for Kelly sizing (more conservative, accounts for overconfidence)
+    prob_col = "adj_prob" if "adj_prob" in bets.columns else "model_prob"
     bets["kelly_frac"] = bets.apply(
-        lambda r: kelly_fraction(r["model_prob"], r["odds"]), axis=1
+        lambda r: kelly_fraction(r[prob_col], r["odds"]), axis=1
     )
     bets["kelly_frac"] = bets["kelly_frac"].clip(upper=max_single_pct)
 

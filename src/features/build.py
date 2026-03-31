@@ -45,7 +45,13 @@ def compute_rest_days(matches: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_market_implied_probs(matches: pd.DataFrame) -> pd.DataFrame:
-    """Compute implied probabilities from average market odds (overround removed)."""
+    """Compute implied probabilities from average market odds (overround removed).
+
+    These columns are used by the betting module for shrinkage and filtering.
+    They are intentionally NOT included as model features (filtered out by
+    the MARKET_PREFIX exclusion in train.py) — the model needs to find signal
+    the market doesn't already price in, not learn to copy the market.
+    """
     results = []
     for _, row in matches.iterrows():
         odds_h = row.get("odds_avg_home", np.nan)
