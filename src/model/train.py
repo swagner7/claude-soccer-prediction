@@ -28,7 +28,7 @@ from src.config import (
     RANDOM_STATE,
     TEST_FRACTION,
 )
-from src.model.calibrate import CalibratedMulticlassModel
+from src.model.calibrate import select_best_calibration
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -510,27 +510,39 @@ def train_group(
         best_params = {}
 
     # ===================================================================
-    # Phase 3: Calibrate
+    # Phase 3: Calibrate (auto-select best method per model)
     # ===================================================================
     logger.info(f"\n  --- Phase 3: Calibrating ({group_name}) ---")
+    logger.info("    Methods: none (raw), temperature, platt, isotonic")
+    logger.info("    Selecting best via 3-fold CV on calibration set")
 
     calibrated_models = {}
     cal_results = {}
 
     for name, (predictor, _) in all_models.items():
-        calibrator = CalibratedMulticlassModel(predictor)
-        calibrator.fit(X_cal, y_cal)
-        calibrated_models[name] = calibrator
+        cal_model, method, cv_scores = select_best_calibration(
+            predictor, X_cal, y_cal, n_classes=3, n_folds=3,
+        )
+        calibrated_models[name] = cal_model
 
-        cal_preds = calibrator.predict_proba(X_test)
+        cal_preds = cal_model.predict_proba(X_test)
         ll = log_loss(y_test, cal_preds, labels=[0, 1, 2])
         acc = accuracy_score(y_test, np.argmax(cal_preds, axis=1))
-        cal_results[name] = {"log_loss": ll, "accuracy": acc, "preds": cal_preds}
-        logger.info(f"    {name:25s}  cal_log_loss={ll:.4f}  accuracy={acc:.4f}")
+        raw_ll = raw_results[name]["log_loss"]
+        cal_results[name] = {
+            "log_loss": ll, "accuracy": acc, "preds": cal_preds,
+            "cal_method": method,
+        }
+        cv_str = ", ".join(f"{m}={s:.4f}" for m, s in sorted(cv_scores.items()))
+        delta = ll - raw_ll
+        logger.info(f"    {name:25s}  cal_ll={ll:.4f} (raw={raw_ll:.4f}, "
+                     f"{'+'if delta>=0 else ''}{delta:.4f})  method={method}")
+        logger.info(f"      CV: {cv_str}")
 
     best_name = min(cal_results, key=lambda k: cal_results[k]["log_loss"])
     logger.info(f"    BEST for {group_name}: {best_name} "
-                f"(cal_log_loss={cal_results[best_name]['log_loss']:.4f})")
+                f"(cal_ll={cal_results[best_name]['log_loss']:.4f}, "
+                f"method={cal_results[best_name]['cal_method']})")
 
     # Save models
     for name, (_, raw_model) in all_models.items():
@@ -554,6 +566,7 @@ def train_group(
             "raw_accuracy": round(raw_results[name]["accuracy"], 4),
             "cal_log_loss": round(cal_results[name]["log_loss"], 4),
             "cal_accuracy": round(cal_results[name]["accuracy"], 4),
+            "cal_method": cal_results[name].get("cal_method", "isotonic"),
         }
     with open(save_dir / "model_comparison.json", "w") as f:
         json.dump(comparison, f, indent=2)
